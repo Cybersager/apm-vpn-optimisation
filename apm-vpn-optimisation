@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# Version 1 19/3/2020 P.White
+# This is a script to check your APM system and give suggestions to reduce CPU usage
+# Taken from suggestions at https://support.f5.com/csp/article/K46161759
+
+
+suggestions="--- Optimisation Suggestions ---\n"
+
+getLicensedCompression () {
+    # Show the licensed compression
+    comp=`tmsh -q show sys license detail|grep perf_http_compression|awk '{print $2}'|sed 's/\[\(.*\)\]/\1/g'`
+    if [ x$comp != "x" ];then
+        echo -n "$comp"
+    else
+        echo -n "Error!"
+    fi
+}
+
+getHardwareCompression () {
+    # Show hardware compression
+    hcomp=`tmsh -q show sys license detail|grep "HTTP Hardware Compression"`
+    if [ x$hcomp = "x" ];then
+        # Hardware compression is not enabled
+        echo -n "None"
+    else
+        echo -n "$hcomp"
+    fi
+}
+
+clear
+echo "APM Optimisation Visibility"
+# CPU usage
+cur=`tmsh -q show sys cpu |grep "Utilization"|awk '{print $2}'`
+avg=`tmsh -q show sys cpu |grep "Utilization"|awk '{print $3}'`
+max=`tmsh -q show sys cpu |grep "Utilization"|awk '{print $4}'`
+if [ $avg -gt 90 ];then
+        suggestions+=" - CPU rate is VERY HIGH! Turn off compression, implement split tunneling and consider more processing\n"
+elif [ $avg -gt 60 ];then
+        suggestions+=" - CPU rate is HIGH! Turn off compression and consider split tunneling for non-internal traffic\n"
+elif [ $avg -gt 40 ];then
+        suggestions+=" - CPU rate is MEDIUM. Consider turning off compression where required\n"
+else
+        suggestions+=" - CPU rate is LOW. Go down the Winchester and wait for it all to blow over\n"
+fi
+
+echo
+echo "CPU Usage"
+echo "--------------------------------"
+echo -e "Current\tAverage\tMaximum"
+echo -e "$cur%\t$avg%\t$max%"
+echo "--------------------------------"
+echo
+
+
+# Compression
+clic=`getLicensedCompression`
+chw=`getHardwareCompression`
+
+if [ $chw = "None" ];then
+        suggestions+=" - Hardware Compression is not included so consider turning off the feature\n"
+fi
+
+echo "Compression"
+echo "--------------------------------"
+echo -e "Licensed\tHardware"
+echo -e "$clic\t$chw"
+echo "--------------------------------"
+
+echo
+echo "Connectivity Profile Compression"
+echo "--------------------------------"
+echo -e "Profile Name\t\tStatus"
+echo "--------------------------------"
+for profile in `tmsh -q list apm profile connectivity one-line|awk '{print $4}'`;do
+        if [ $profile = "connectivity" ];then
+                continue
+        fi
+        if [ `tmsh -q list apm profile connectivity $profile one-line|grep "compress-gzip-level 0"|wc -l` -gt 0 ];then
+                echo -e "$profile\t\tDisabled"
+        else
+                suggestions+=" - To turn off compression in the connectivity profile, run the command 'tmsh modify apm profile connectivity $profile compression disabled'\n"
+                echo -e "$profile\t\tDisabled"
+        fi
+done
+echo "--------------------------------"
+
+echo
+echo "Network Access Profile Compression"
+echo "------------------------------------------------------------------------------------"
+echo -e " Name\t\t| Compression\t| Split-Tunneling\t| Client Traffic Classifier"
+echo "------------------------------------------------------------------------------------"
+for profile in `tmsh -q list apm resource network-access one-line|awk '{print $4}'`;do
+        # Compression
+        if [ `tmsh -q list apm resource network-access $profile one-line|grep "compression gzip"|wc -l` -gt 0 ];then
+                echo -en "$profile\t\t| Enabled"
+                suggestions+=" - To turn off compression in the NA profile, run the command 'tmsh modify apm resource network-access $profile compression none'\n"
+        else
+                echo -en "$profile\t\t| Disabled"
+        fi
+
+        if [ `tmsh -q list apm resource network-access $profile one-line|grep "split-tunneling true"|wc -l` -gt 0 ];then
+                echo -en "\t| Enabled"
+        else
+                echo -en "\t| Disabled"
+                suggestions+=" - To turn on split-tunneling, run the command 'tmsh modify apm resource network-access $profile split-tunneling true'\n"
+                suggestions+=" - To configure split-tunneling exclude traffic by DNS name, run the command 'tmsh modify apm resource network-access $profile address-space-exclude-dns-name add { office.com microsoftonline.com google.com gmail.com facebook.com }'\n"
+                suggestions+=" - To configure split-tunneling exclude traffic by IP address, run the command 'tmsh modify apm resource network-access $profile address-space-include-subnet add { { subnet 10.0.0.0/8 } { subnet 172.16.0.0/16 } { subnet 192.168.0.0/16 } }'\n"
+        fi
+
+        if [ `tmsh -q list apm resource network-access $profile one-line|grep "client-traffic-classifier "|wc -l` -gt 0 ];then
+                echo -en "\t\t| Enabled"
+        else
+                echo -en "\t\t| Disabled"
+                suggestions+=" - To turn on Client Traffic Classifier, run the commands below:\n"
+                suggestions+="tmsh create apm resource client-rate-class rate_class_2M { rate 2000000 }\n"
+                suggestions+="tmsh create apm resource client-rate-class rate_class_1M { rate 1000000 }\n"
+                suggestions+="tmsh create apm resource client-traffic-classifier client-traffic-classifier-1 { entries add { entry { client-rate-class rate_class_1M dst-ip any dst-mask any dst-port https src-ip any src-mask any } entry0 { client-rate-class rate_class_2M dst-ip any dst-mask any dst-port any src-ip any src-mask any } } }\n"
+                suggestions+="tmsh modify apm resource network-access $profile client-traffic-classifier client-traffic-classifier-1\n"
+        fi
+        # Check for SNAT automap
+        if [ `tmsh -q list apm resource network-access $profile one-line all-properties|grep "snat automap"|wc -l` -gt 0 ];then
+                suggestions+=" - Network Access profile $profile is using SNAT automap. Consider using a SNAT pool\n"
+        fi
+
+        echo ""
+
+done
+echo "------------------------------------------------------------------------------------"
+
+# Check VSs for mirroring
+
+for vs in `tmsh list ltm virtual one-line|awk '{print $3}'`;do
+        if [ `tmsh -q list ltm virtual $vs mirror|grep "mirror enabled"|wc -l` -gt 0 ];then
+                echo
+                echo "WARNING! Virtual Server $vs has mirroring enabled\n"
+                echo
+                suggestions+="Consider disabling Connection Mirroring for virtual server $vs with the command 'tmsh modify ltm virtual $vs mirror disabled'\n"
+        fi
+done
+
+
+
+echo
+echo -en "$suggestions"
