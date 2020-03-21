@@ -1,0 +1,171 @@
+
+cli admin-partitions {
+    update-partition Common
+}
+sys application template /Common/apm-vpn-optimisation_icall {
+    actions {
+        definition {
+            html-help {
+            }
+            implementation {
+                set app_dir [tmsh::pwd]
+				set app_name $tmsh::app_name
+
+                set icallTemplate {# Retrieve the CPU usage
+set cpuStatus [tmsh::get_status sys cpu]
+set numCpus 0
+set totalUsage 0
+foreach {cpu} $cpuStatus {
+    incr numCpus
+    set name [tmsh::get_name $cpu]
+    set value [tmsh::get_field_value $cpu cpu-info.${name}.five-min-avg-system ]
+    incr totalUsage $value
+}
+set cpuRate [ expr { $totalUsage / $numCpus } ]
+tmsh::log "apm-vpn-optimisation:CPU rate: $cpuRate"
+
+
+# Set features on or off
+if { $cpuRate > 90 } {
+    set compression 0
+    set split-tunneling 1
+    set rate-class "rate_class_100K"
+    set client-traffic-classifier 1
+} elseif { $cpuRate > 60 } {
+    set compression 0
+    set split-tunneling 1
+    set rate-class "rate_class_500K"
+    set client-traffic-classifier 1
+} elseif { $cpuRate > 40 } {
+    set compression 0
+    set split-tunneling 0
+    set rate-class "rate_class_1M"
+    set client-traffic-classifier 1
+} elseif { $cpuRate > 20 } {
+    set compression 1
+    set split-tunneling 0
+    set rate-class "rate_class_1M"
+    set client-traffic-classifier 1
+} else {
+    set compression 1
+    set split-tunneling 0
+    set rate-class "rate_class_1M"
+    set client-traffic-classifier 0
+}
+
+# Set compression
+set connectivityProfiles [tmsh::get_config apm profile connectivity all-properties]
+foreach {profile} $connectivityProfiles {
+    set name [tmsh::get_name $profile]
+    if { $name == "connectivity" } { continue }
+    if { $compression > 0 } {
+        # Turn on
+        tmsh::log "apm-vpn-optimisation:Turning on compression for profile $name: compress-gzip-level 6"
+        tmsh::modify apm profile connectivity $name compress-gzip-level 6
+    } else {
+        # Turn off
+        tmsh::log "apm-vpn-optimisation:Turning off compression for profile $name: compress-gzip-level 0"
+        tmsh::modify apm profile connectivity $name compress-gzip-level 0
+    }
+}
+set networkAccessProfiles [tmsh::get_config apm resource network-access all-properties]
+foreach {profile} $networkAccessProfiles {
+    set name [tmsh::get_name $profile]
+    if { $compression > 0 } {
+        # Turn on
+        tmsh::log "apm-vpn-optimisation:Turning on compression for profile $name: compression gzip"
+        tmsh::modify apm resource network-access $name compression gzip
+    } else {
+        # Turn off
+        tmsh::log "apm-vpn-optimisation:Turning off compression for profile $name: compression none"
+        tmsh::modify apm resource network-access $name compression none
+    }
+}
+
+# Set split-tunneling
+set networkAccessProfiles [tmsh::get_config apm resource network-access all-properties]
+foreach {profile} $networkAccessProfiles {
+    set name [tmsh::get_name $profile]
+    tmsh::begin_transaction
+    if { ${split-tunneling} > 0 } {
+        tmsh::log "apm-vpn-optimisation:Turning on split-tunneling for profile $name: split-tunneling true"
+        tmsh::modify apm resource network-access $name address-space-exclude-dns-name add \{ office.com microsoftonline.com google.com gmail.com facebook.com \}
+        tmsh::modify apm resource network-access $name address-space-include-subnet \{\{ subnet 10.0.0.0/8 \} \{ subnet 172.16.0.0/16 \} \{ subnet 192.168.0.0/16 \}\}
+        tmsh::modify apm resource network-access $name split-tunneling true
+    } else {
+        tmsh::log "apm-vpn-optimisation:Turning off split-tunneling for profile $name: split-tunneling false"
+        tmsh::modify apm resource network-access $name split-tunneling false
+    }
+    tmsh::commit_transaction
+}
+
+# Create rate class
+tmsh::log "apm-vpn-optimisation:Creating client-rate-classes and client-traffic-classifier-1. rate: ${rate-class}"
+tmsh::stateless enabled
+tmsh::begin_transaction
+tmsh::create apm resource client-rate-class rate_class_4M \{ rate 4000000 \}
+tmsh::create apm resource client-rate-class rate_class_2M \{ rate 2000000 \}
+tmsh::create apm resource client-rate-class rate_class_1M \{ rate 1000000 \}
+tmsh::create apm resource client-rate-class rate_class_500K \{ rate 500000 \}
+tmsh::create apm resource client-rate-class rate_class_100K \{ rate 100000 \}
+tmsh::create apm resource client-traffic-classifier client-traffic-classifier-1 \{ entries add \{ \
+entry \{ client-rate-class ${rate-class} dst-ip any dst-mask any dst-port https src-ip any src-mask any \} \
+entry0 \{ client-rate-class rate_class_2M dst-ip any dst-mask any dst-port stun protocol 17 src-ip any src-mask any \} \
+entry1 \{ client-rate-class rate_class_2M dst-ip any dst-mask any dst-port twrpc protocol 17 src-ip any src-mask any \} \
+entry2 \{ client-rate-class rate_class_2M dst-ip any dst-mask any dst-port plethora protocol 17 src-ip any src-mask any \} \
+entry3 \{ client-rate-class rate_class_2M dst-ip any dst-mask any dst-port cleanerliverc protocol 17 src-ip any src-mask any \} \
+\} \}
+tmsh::commit_transaction
+tmsh::stateless disabled
+
+set networkAccessProfiles [tmsh::get_config apm resource network-access all-properties]
+foreach {profile} $networkAccessProfiles {
+    set name [tmsh::get_name $profile]
+    tmsh::begin_transaction
+    if { ${client-traffic-classifier} > 0 } {
+        # Turn on
+        tmsh::log "apm-vpn-optimisation:Turning on client-traffic-classifier for profile $name: client-traffic-classifier client-traffic-classifier-1"
+        tmsh::modify apm resource network-access $name client-traffic-classifier client-traffic-classifier-1
+    } else {
+        # Turn off
+        tmsh::log "apm-vpn-optimisation:Turning off client-traffic-classifier for profile $name: client-traffic-classifier none"
+        tmsh::modify apm resource network-access $name client-traffic-classifier none
+    }
+    tmsh::commit_transaction
+}
+# Left blank
+}
+				tmsh::create sys icall script "${app_name}_avo_script definition { [tmsh::expand_macro $icallTemplate ] }"
+                tmsh::create sys icall handler periodic ${app_name}_avo_handler interval 300 script ${app_name}_avo_script
+            }
+            
+            presentation {
+			
+				section main {
+					# The entry below creates a large text box that must be filled out with a valid IP Address
+					# For details of APL, look at the iApps developers guide:
+					# https://support.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-iapps-developer-11-4-0.html		
+                    message intro "APM VPN Optimisation Version 1 20/3/2020"	
+                    message usage "Note that this iApp will create an iCall which runs every 5 mins and changes your connectivity and network-access profiles automatically. You should backup your configuration before use to allow rollback to original configuration"	
+				}
+                
+				text {
+					# Entities below set the text for the questions and section names, etc. Make them simple and relevant.
+					main "Main"
+                    main.intro ""
+                    main.usage ""
+				}
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description "APM VPN Optimisation iApp v1"
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min none
+    requires-modules { apm }
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}
