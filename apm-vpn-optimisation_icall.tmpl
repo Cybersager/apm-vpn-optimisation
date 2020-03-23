@@ -133,6 +133,16 @@ foreach {profile} $networkAccessProfiles {
     }
     tmsh::commit_transaction
 }
+# Apply profiles
+set accessProfiles [tmsh::get_config apm profile type]
+foreach {profile} $accessProfiles {
+    set name [tmsh::get_name $profile]
+    # Check type of profile is ssl-vpn
+    if { [tmsh::get_field_value $profile type] == "ssl-vpn" } {
+        tmsh::log "apm-vpn-optimisation: Applying SSL-VPN access profile $name" 
+        tmsh::modify apm profile access $name generation-action increment
+    }
+}
 # Left blank
 }
 				tmsh::create sys icall script "${app_name}_avo_script definition { [tmsh::expand_macro $icallTemplate ] }"
@@ -160,7 +170,7 @@ foreach {profile} $networkAccessProfiles {
             run-as none
         }
     }
-    description "APM VPN Optimisation iApp v1"
+    description "APM VPN Optimisation iApp v2"
     ignore-verification false
     requires-bigip-version-max none
     requires-bigip-version-min none
