@@ -1,8 +1,11 @@
 #!/bin/bash
 
-# Version 1 19/3/2020 P.White
+# Version 3 23/3/2020 P.White
 # This is a script to check your APM system and give suggestions to reduce CPU usage
 # Taken from suggestions at https://support.f5.com/csp/article/K46161759
+
+# v2 - small typo fix line 119 create changed to modify
+# v3 - updated classifier to only include https as it was causing an error
 
 
 suggestions="--- Optimisation Suggestions ---\n"
@@ -115,7 +118,7 @@ for profile in `tmsh -q list apm resource network-access one-line|awk '{print $4
                 suggestions+=" - To turn on Client Traffic Classifier, run the commands below:\n"
                 suggestions+="tmsh create apm resource client-rate-class rate_class_2M { rate 2000000 }\n"
                 suggestions+="tmsh create apm resource client-rate-class rate_class_1M { rate 1000000 }\n"
-                suggestions+="tmsh create apm resource client-traffic-classifier client-traffic-classifier-1 { entries add { entry { client-rate-class rate_class_1M dst-ip any dst-mask any dst-port https src-ip any src-mask any } entry0 { client-rate-class rate_class_2M dst-ip any dst-mask any dst-port any src-ip any src-mask any } } }\n"
+                suggestions+="tmsh create apm resource client-traffic-classifier client-traffic-classifier-1 { entries add { entry { client-rate-class rate_class_1M dst-ip any dst-mask any dst-port https src-ip any src-mask any } } }\n"
                 suggestions+="tmsh modify apm resource network-access $profile client-traffic-classifier client-traffic-classifier-1\n"
         fi
         # Check for SNAT automap
