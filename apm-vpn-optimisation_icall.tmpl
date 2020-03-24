@@ -52,17 +52,20 @@ if { $cpuRate > 90 } {
     set rate-class "rate_class_1M"
     set client-traffic-classifier 0
 }
-
+set changed 0
 # Set compression
 set connectivityProfiles [tmsh::get_config apm profile connectivity all-properties]
 foreach {profile} $connectivityProfiles {
     set name [tmsh::get_name $profile]
     if { $name == "connectivity" } { continue }
-    if { $compression > 0 } {
+    # Get current status
+    set currentStatus [tmsh::get_field_value $profile compress-gzip-level]
+    if { $currentStatus < 1 && $compression > 0 } {
+        # If it is turned off and should be on then turn on
         # Turn on
         tmsh::log "apm-vpn-optimisation:Turning on compression for profile $name: compress-gzip-level 6"
         tmsh::modify apm profile connectivity $name compress-gzip-level 6
-    } else {
+    } elseif { $currentStatus > 0 && $compression < 1 } {
         # Turn off
         tmsh::log "apm-vpn-optimisation:Turning off compression for profile $name: compress-gzip-level 0"
         tmsh::modify apm profile connectivity $name compress-gzip-level 0
@@ -71,14 +74,17 @@ foreach {profile} $connectivityProfiles {
 set networkAccessProfiles [tmsh::get_config apm resource network-access all-properties]
 foreach {profile} $networkAccessProfiles {
     set name [tmsh::get_name $profile]
-    if { $compression > 0 } {
+    set currentStatus [tmsh::get_field_value $profile compression]
+    if { $currentStatus == "none" && $compression > 0 } {
         # Turn on
         tmsh::log "apm-vpn-optimisation:Turning on compression for profile $name: compression gzip"
         tmsh::modify apm resource network-access $name compression gzip
-    } else {
+        set changed 1
+    } elseif { $currentStatus == "gzip" && $compression < 1} {
         # Turn off
         tmsh::log "apm-vpn-optimisation:Turning off compression for profile $name: compression none"
         tmsh::modify apm resource network-access $name compression none
+        set changed 1
     }
 }
 
@@ -86,15 +92,18 @@ foreach {profile} $networkAccessProfiles {
 set networkAccessProfiles [tmsh::get_config apm resource network-access all-properties]
 foreach {profile} $networkAccessProfiles {
     set name [tmsh::get_name $profile]
+    set currentStatus [tmsh::get_field_value $profile split-tunneling]
     tmsh::begin_transaction
-    if { ${split-tunneling} > 0 } {
+    if { $currentStatus != "true" && ${split-tunneling} > 0 } {
         tmsh::log "apm-vpn-optimisation:Turning on split-tunneling for profile $name: split-tunneling true"
         tmsh::modify apm resource network-access $name address-space-exclude-dns-name add \{ office.com microsoftonline.com google.com gmail.com facebook.com \}
         tmsh::modify apm resource network-access $name address-space-include-subnet \{\{ subnet 10.0.0.0/8 \} \{ subnet 172.16.0.0/16 \} \{ subnet 192.168.0.0/16 \}\}
         tmsh::modify apm resource network-access $name split-tunneling true
-    } else {
+        set changed 1
+    } elseif { $currentStatus == "true" && ${split-tunneling} < 1 } {
         tmsh::log "apm-vpn-optimisation:Turning off split-tunneling for profile $name: split-tunneling false"
         tmsh::modify apm resource network-access $name split-tunneling false
+        set changed 1
     }
     tmsh::commit_transaction
 }
@@ -121,26 +130,32 @@ tmsh::stateless disabled
 set networkAccessProfiles [tmsh::get_config apm resource network-access all-properties]
 foreach {profile} $networkAccessProfiles {
     set name [tmsh::get_name $profile]
+    set currentStatus [tmsh::get_field_value $profile client-traffic-classifier]
     tmsh::begin_transaction
-    if { ${client-traffic-classifier} > 0 } {
+    if { $currentStatus != "client-traffic-classifier-1" && ${client-traffic-classifier} > 0 } {
         # Turn on
         tmsh::log "apm-vpn-optimisation:Turning on client-traffic-classifier for profile $name: client-traffic-classifier client-traffic-classifier-1"
         tmsh::modify apm resource network-access $name client-traffic-classifier client-traffic-classifier-1
-    } else {
+        set changed 1
+    } elseif { $currentStatus == "client-traffic-classifier-1" && ${client-traffic-classifier} < 1} {
         # Turn off
         tmsh::log "apm-vpn-optimisation:Turning off client-traffic-classifier for profile $name: client-traffic-classifier none"
         tmsh::modify apm resource network-access $name client-traffic-classifier none
+        set changed 1
     }
     tmsh::commit_transaction
 }
+}
 # Apply profiles
-set accessProfiles [tmsh::get_config apm profile type]
-foreach {profile} $accessProfiles {
-    set name [tmsh::get_name $profile]
-    # Check type of profile is ssl-vpn
-    if { [tmsh::get_field_value $profile type] == "ssl-vpn" } {
-        tmsh::log "apm-vpn-optimisation: Applying SSL-VPN access profile $name" 
-        tmsh::modify apm profile access $name generation-action increment
+if { $changed > 0 } {
+    set accessProfiles [tmsh::get_config apm profile type]
+    foreach {profile} $accessProfiles {
+        set name [tmsh::get_name $profile]
+        # Check type of profile is ssl-vpn
+        if { [tmsh::get_field_value $profile type] == "ssl-vpn" } {
+            tmsh::log "apm-vpn-optimisation: Applying SSL-VPN access profile $name" 
+            tmsh::modify apm profile access $name generation-action increment
+        }
     }
 }
 # Left blank
@@ -170,7 +185,7 @@ foreach {profile} $accessProfiles {
             run-as none
         }
     }
-    description "APM VPN Optimisation iApp v2"
+    description "APM VPN Optimisation iApp v3"
     ignore-verification false
     requires-bigip-version-max none
     requires-bigip-version-min none
