@@ -96,7 +96,7 @@ foreach {profile} $networkAccessProfiles {
     tmsh::begin_transaction
     if { $currentStatus != "true" && ${split-tunneling} > 0 } {
         tmsh::log "apm-vpn-optimisation:Turning on split-tunneling for profile $name: split-tunneling true"
-        tmsh::modify apm resource network-access $name address-space-exclude-dns-name add \{ office.com microsoftonline.com google.com gmail.com facebook.com \}
+        tmsh::modify apm resource network-access $name address-space-exclude-dns-name add \{ office.com office365.com sharepoint.com sharepointonline.com microsoftonline.com google.com gmail.com facebook.com \}
         tmsh::modify apm resource network-access $name address-space-include-subnet \{\{ subnet 10.0.0.0/8 \} \{ subnet 172.16.0.0/16 \} \{ subnet 192.168.0.0/16 \}\}
         tmsh::modify apm resource network-access $name split-tunneling true
         set changed 1
