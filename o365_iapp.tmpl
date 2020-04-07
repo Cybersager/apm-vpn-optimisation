@@ -1,0 +1,653 @@
+cli admin-partitions {
+    update-partition Common
+}
+sys application template /Common/o365_optimisation {
+    actions {
+        definition {
+            html-help {
+                <h1>Office 365 Optimisation iCall Version 1</h1>
+                <p>To see this in a wider window, hit the Launch button above</p>
+                <p>For help on the various options, go to https://github.com/f5regan/o365-apm-split-tunnel</p>
+                <p>This script fetches Office 365 URLs and IPs (IPv4 and/or IPv6) from Microsoft's Office 365 
+                IP Address and URL web service, dynamically updates Network Access List "Exclude" properties 
+                for one or more Network Access Lists, and applies changes to the affected Access Policies. 
+                If the script is running on an HA pair of BIG-IPs then the script will also initiate a 
+                ConfigSync to push the updated configuration from the active BIG-IP to the standby BIG-IP.
+                <h2>Script Requirements</h2>
+                <ul>
+                    <li>TMOS 12.1.0 or higher
+                    </li>
+                    <li>BIG-IP must be capable of resolving internet DNS names (ex. via DNS Lookup Server configuration)
+                    </li>
+                    <li>BIG-IP must be able to reach endpoints.office.com via TCP 443 (via Management or TMM interface)
+                    </li>
+                    <li>Administrative rights on the BIG-IP(s)
+                    </li>
+                    <li>Bash shell access on the BIG-IP(s)
+                    </li>
+                </ul>
+                <h2>Things to Note</h2>
+                <ul>
+                    <li>This software is supplied "AS IS" without any warranties or support.
+                    </li>
+                    <li>This script does not enable “split tunneling” or make any other modifications, other than those mentioned, 
+                        to the Network Access List(s) that may be required to enable the desired functionality. For guidance relating to 
+                        Network Access List / Split Tunnelling configuration refer to the BIG-IP APM Knowledge Center.
+                    </li>
+                    <li>Some split tunneling guidance:
+                        <ul>
+                            <li>Allow Local DNS Servers should be enabled to allow client access to Office 365 when VPN is disconnected
+                            </li>
+                            <li>DNS Exclude Address Space is not supported on macOS
+                            </li>
+                            <li>IPV6 Exclude Address Space doesn't currently work on macOS
+                            </li>
+                        </ul>
+                    </li>
+                    <li>This script should not be used with BIG-IP Edge Client's Always Connected Mode: if Stonewall is configured 
+                        to block traffic, then the excluded resources are not reachable (this is by design).</li>
+                    <li>This script tracks the version of the Office 365 service instance and will only update the exclusion 
+                        lists if a newer version is detected. If modifications to the script's operating parameters 
+                        (ex. Network Access Lists, O365 Service Areas, Additional URLs/IPs to Exclude) are made, they will 
+                        NOT take effect until the script detects a new service instance version. To force the script to run 
+                        with the updated parameters earlier, remove the o365_version.txt file from the script's working directory 
+                        OR temporarily set force_o365_record_refresh = 1, then manually execute the script 
+                        (python /shared/o365/apm_o365_update.py).
+                    </li>
+                    <li>This script overwrites the contents of the following fields in the defined Network Access Lists when 
+                        an update is detected:
+                        <ul>
+                            <li>If "use_url" is set to 1: DNS Exclude Address Space
+                            </li>
+                            <li>If "use_ipv4" is set to 1: IPV4 Exclude Address Space
+                            </li>
+                            <li>If "use_ipv6" is set to 1: IPV6 Exclude Address Space
+                            </li>
+                        </ul>
+                    </li>
+                    <li>The aforementioned fields / properties should not be managed via TMSH or the GUI after implementing this 
+                        script as the script will overwrite any manual changes to these fields when it detects the next Office 365 
+                        service instance update. To add non-Office 365 URLs/IPs to or remove any URL/IP (Office 365 or otherwise) 
+                        from the "Exclude Address Space" properties of the Network Access Lists, use the noimport_* and additional_* 
+                        fields in the script (see User Options in the Appendix for usage details) . Be sure to apply these changes to 
+                        both units of an HA pair!
+                    </li>
+                    <li>Usage of DNS Address Exclusions requires the installation of the DNS Relay Proxy service on the VPN client
+                        <ul>
+                            <li>K9694: Overview of the Windows DNS Relay Proxy service
+                            </li>
+                            <li>K49720803: BIG-IP Edge Client operations guide | Chapter 3: Common approaches to configuring VPN
+                            </li>
+                        </ul>
+                    </li>
+                    <li>While the endpoints retrieved by this script handle the vast majority of Office 365 traffic, it is possible some 
+                        traffic related to Office 365 is not summarized in the endpoint lists and will still go through the VPN.
+                    </li>
+                    <li>HA: This script must be implemented on both members of an HA pair
+                    </li>
+                    <li>HA: Updates made to the Python script are NOT synchronized between peers - updates must be made manually to each 
+                        instance of the Python script
+                    </li>
+                    <li>HA: Exclusion list updates will only take place on the Active member - changes are synced from the Active to 
+                        Standby by the script
+                    </li>
+                    <li>This script relies on iCall to periodically run. See What is iCall? on DevCentral for an overview of iCall. 
+                        iCall scripts and periodic handlers are documented in greater detail in the F5 TMSH Reference.
+                    </li>
+            }
+            implementation {
+                set app_dir [tmsh::pwd]
+				set app_name $tmsh::app_name
+                set script {#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# O365 URL/IP update automation for BIG-IP
+# Version: 1.1
+# Last Modified: 01 April 2020
+# Original author: Makoto Omura, F5 Networks Japan G.K.
+#
+# Modified for APM Network Access "Exclude Address Space" by Regan Anderson, F5 Networks
+# Modified for iCall by Peter White, F5 Networks
+# 
+# This Sample Software provided by the author is for illustrative
+# purposes only which provides customers with programming information
+# regarding the products. This software is supplied "AS IS" without any
+# warranties and support.
+#
+# The author assumes no responsibility or liability for the use of the
+# software, conveys no license or title under any patent, copyright, or
+# mask work right to the product.
+#
+# The author reserves the right to make changes in the software without
+# notification. The author also make no representation or warranty that
+# such application will be suitable for the specified use without
+# further testing or modification.
+#-----------------------------------------------------------------------
+
+import httplib
+import urllib
+import uuid
+import os
+import re
+import json
+import commands
+import datetime
+import sys
+
+#-----------------------------------------------------------------------
+# User Options - Configure as desired
+#-----------------------------------------------------------------------
+
+# Access Profile Name(s) - ex. SINGLE ["AP1"] OR MULTIPLE ["AP1", "AP2", "AP3"]
+access_profiles = [}
+set accessProfiles {}
+set naList {}
+foreach {row} $::main__access_profile {
+    array set cols [lindex $row 0]
+    lappend accessProfiles "\"$cols(profile)\" "
+    lappend naLists "\"$cols(nalist)\" "
+}
+append script [ join $accessProfiles , ]
+append script {]
+
+# Network Access List Name(s) - ex. SINGLE ["NAL1"] OR MULTIPLE ["NAL1", "NAL2", "NAL3"]
+na_lists = [}
+append script [ join $naLists , ]
+append script {]
+
+# Microsoft Web Service Customer endpoints (ENABLE ONLY ONE ENDPOINT)
+# These are the set of URLs defined by customer endpoints as described here: https://docs.microsoft.com/en-us/office365/enterprise/urls-and-ip-address-ranges
+customer_endpoint = }
+append script "\"$::main__endpoint\""
+append script {
+
+# O365 "SeviceArea" (O365 endpoints) to consume, as described here: https://docs.microsoft.com/en-us/office365/enterprise/urls-and-ip-address-ranges
+care_exchange = }
+append script $config__include_exchange
+append script {                       # "Exchange Online": 0=do not care, 1=care
+care_sharepoint = }
+append script $config__include_sharepoint
+append script {                     # "SharePoint Online and OneDrive for Business": 0=do not care, 1=care
+care_skype = }
+append script $config__include_skype
+append script {                          # "Skype for Business Online and Microsoft Teams": 0=do not care, 1=care
+care_common = }
+append script $config__include_common
+append script {                         # "Microsoft 365 Common and Office Online": 0=do not care, 1=care
+
+# O365 Record types to download & update
+use_url = }
+append script $config__use_url
+append script {                             # DNS/URL exclusions: 0=do not use, 1=use
+use_ipv4 = }
+append script $config__use_ipv4
+append script {                            # IPv4 exclusions: 0=do not use, 1=use
+use_ipv6 = }
+append script $config__use_ipv6
+append script {                            # IPv6 exclusions: 0=do not use, 1=use
+
+# O365 Categories to download & update
+o365_categories = }
+append script $config__o365_categories
+append script {                     # 0=Optimize only, 1= Optimize & Allow, 2 = Optimize, Allow, and Default
+
+# O365 Endpoints to import - O365 required endpoints or all endpoints
+# WARNING: "import all" includes non-O365 URLs that one may not want to bypass (ex. www.youtube.com)
+only_required = }
+append script $config__only_required
+append script {                       # 0=import all, 1=O365 required only
+
+# Don't import these O365 URLs (URL must be exact or ends_with match to URL as it exists in JSON record - pattern matching not supported)
+# Provide URLs in list format - ex. [".facebook.com", "*.itunes.apple.com", "bit.ly"]
+#noimport_urls = []
+noimport_urls = [".symcd.com",".symcb.com",".entrust.net",".digicert.com",".identrust.com",".verisign.net",".globalsign.net",".globalsign.com",".geotrust.com",".omniroot.com",".letsencrypt.org",".public-trust.com","platform.linkedin.com"]
+
+# Don't import these O365 IPs (IP must be exact match to IP as it exists in JSON record - IP/CIDR mask cannot be modified)
+# Provide IPs (IPv4 and IPv6) in list format - ex. ["191.234.140.0/22", "2620:1ec:a92::152/128"]
+noimport_ips = []
+
+# Non-O365 URLs to add to DNS Exclude List
+# Provide URLs in list format - ex. ["m.facebook.com", "*.itunes.apple.com", "bit.ly"]
+additional_urls = [}
+set additional_urls {}
+foreach {row} $::config__additional_urls {
+    array set cols [lindex $row 0]
+    lappend additional_urls "\"$cols(url)\""
+}
+append script [ join $additional_urls , ]
+append script {]
+
+# Non-O365 IPs to add to IPV4 Exclude List
+# Provide IPs in list format - ex. ["191.234.140.0/22", "131.253.33.215/32"]
+additional_ipv4 = [}
+
+set additional_ips {}
+foreach {row} $::config__additional_ips {
+    array set cols [lindex $row 0]
+    lappend additional_ips "\"$cols(ip)\""
+}
+append script [ join $additional_ips , ]
+append script {]
+
+# Non-O365 IPs to add to IPV6 Exclude List
+# Provide IPs in list format - ex. ["2603:1096:400::/40", "2620:1ec:a92::152/128"]
+additional_ipv6 = []
+
+# Action if O365 endpoint list is not updated
+force_o365_record_refresh = 0           # 0=do not update, 1=update (for test/debug purpose)
+
+# BIG-IP HA Configuration
+device_group_name = "}
+append script $config__dg
+append script {"     # Name of Sync-Failover Device Group.  Required for HA paired BIG-IP.
+ha_config = }
+if { [llength [tmsh::get_config cm device]] > 1 } {
+    append script "1"
+} else {
+    append script "0"
+}
+append script {                           # 0=stand alone, 1=HA paired
+
+# Log configuration
+log_level = }
+append script $main__debug
+append script {                           # 0=none, 1=normal, 2=verbose
+
+#-----------------------------------------------------------------------
+# System Options - Modify only when necessary
+#-----------------------------------------------------------------------
+
+# Working directory, file name for guid & version management
+work_directory = "/shared/o365/"
+file_name_guid = "/shared/o365/guid.txt"
+file_ms_o365_version = "/shared/o365/o365_version.txt"
+log_dest_file = "/var/log/o365_update"
+
+# Microsoft Web Service URLs
+url_ms_o365_endpoints = "endpoints.office.com"
+url_ms_o365_version = "endpoints.office.com"
+uri_ms_o365_version = "/version?ClientRequestId="
+
+#-----------------------------------------------------------------------
+# Implementation - Please do not modify
+#-----------------------------------------------------------------------
+list_urls_to_exclude = []
+list_ipv4_to_exclude = []
+list_ipv6_to_exclude = []
+
+def log(lev, msg):
+    if log_level >= lev:
+        log_string = "{0:%Y-%m-%d %H:%M:%S}".format(datetime.datetime.now()) + " " + msg + "\n"
+        f = open(log_dest_file, "a")
+        f.write(log_string)
+        f.flush()
+        f.close()
+    return
+
+def main():
+    # -----------------------------------------------------------------------
+    # Check if this BIG-IP is ACTIVE for the traffic group (= traffic_group_name)
+    # -----------------------------------------------------------------------
+    result = commands.getoutput("tmsh show /cm failover-status field-fmt")
+
+    if ("status ACTIVE" in result) or (ha_config == 0):
+        log(1, "This BIG-IP is standalone or HA ACTIVE. Initiating O365 update.")
+    else:
+        log(1, "This BIG-IP is HA STANDBY. Aborting O365 update.")
+        sys.exit(0)
+
+
+    # -----------------------------------------------------------------------
+    # GUID management
+    # -----------------------------------------------------------------------
+    # Create guid file if not existent
+    if not os.path.isdir(work_directory):
+        os.mkdir(work_directory)
+        log(1, "Created work directory " + work_directory + " because it did not exist.")
+    if not os.path.exists(file_name_guid):
+        f = open(file_name_guid, "w")
+        f.write("\n")
+        f.flush()
+        f.close()
+        log(1, "Created GUID file " + file_name_guid + " because it did not exist.")
+
+    # Read guid from file and validate.  Create one if not existent
+    f = open(file_name_guid, "r")
+    f_content = f.readline()
+    f.close()
+    if re.match('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', f_content):
+        guid = f_content
+        log(2, "Valid GUID is read from local file " + file_name_guid + ".")
+    else:
+        guid = str(uuid.uuid4())
+        f = open(file_name_guid, "w")
+        f.write(guid)
+        f.flush()
+        f.close()
+        log(1, "Generated a new GUID, and saved it to " + file_name_guid + ".")
+
+
+    # -----------------------------------------------------------------------
+    # O365 endpoints list version check
+    # -----------------------------------------------------------------------
+    # Read version of previously received record
+    if os.path.isfile(file_ms_o365_version):
+        f = open(file_ms_o365_version, "r")
+        f_content = f.readline()
+        f.close()
+        # Check if the VERSION record format is valid
+        if re.match('[0-9]{10}', f_content):
+            ms_o365_version_previous = f_content
+            log(2, "Valid previous VERSION found in " + file_ms_o365_version + ".")
+        else:
+            ms_o365_version_previous = "1970010200"
+            f = open(file_ms_o365_version, "w")
+            f.write(ms_o365_version_previous)
+            f.flush()
+            f.close()
+            log(1, "Valid previous VERSION was not found.  Wrote dummy value in " + file_ms_o365_version + ".")
+    else:
+        ms_o365_version_previous = "1970010200"
+        f = open(file_ms_o365_version, "w")
+        f.write(ms_o365_version_previous)
+        f.flush()
+        f.close()
+        log(1, "Valid previous VERSION was not found.  Wrote dummy value in " + file_ms_o365_version + ".")
+
+
+    # -----------------------------------------------------------------------
+    # O365 endpoints list VERSION check
+    # -----------------------------------------------------------------------
+    request_string = uri_ms_o365_version + guid
+    conn = httplib.HTTPSConnection(url_ms_o365_version)
+    conn.request('GET', request_string)
+    res = conn.getresponse()
+
+    if not res.status == 200:
+        # MS O365 version request failed
+        log(1, "VERSION request to MS web service failed.  Assuming VERSIONs did not match, and proceed.")
+        dict_o365_version = {}
+    else:
+        # MS O365 version request succeeded
+        log(2, "VERSION request to MS web service was successful.")
+        dict_o365_version = json.loads(res.read())
+
+    ms_o365_version_latest = ""
+    for record in dict_o365_version:
+        if record.has_key('instance'):
+            if record["instance"] == customer_endpoint and record.has_key("latest"):
+                latest = record["latest"]
+                if re.match('[0-9]{10}', latest):
+                    ms_o365_version_latest = latest
+                    f = open(file_ms_o365_version, "w")
+                    f.write(ms_o365_version_latest)
+                    f.flush()
+                    f.close()
+
+    log(2, "Previous VERSION is " + ms_o365_version_previous)
+    log(2, "Latest VERSION is " + ms_o365_version_latest)
+
+    if ms_o365_version_latest == ms_o365_version_previous and force_o365_record_refresh == 0:
+        log(1, "You already have the latest MS O365 URL/IP Address list: " + ms_o365_version_latest + ". Aborting operation.")
+        sys.exit(0)
+
+
+    # -----------------------------------------------------------------------
+    # Request O365 endpoints list & put it in dictionary
+    # -----------------------------------------------------------------------
+    request_string = "/endpoints/" + customer_endpoint + "?ClientRequestId=" + guid
+    conn = httplib.HTTPSConnection(url_ms_o365_endpoints)
+    conn.request('GET', request_string)
+    res = conn.getresponse()
+
+    if not res.status == 200:
+        log(1, "ENDPOINTS request to MS web service failed. Aborting operation.")
+        sys.exit(0)
+    else:
+        log(2, "ENDPOINTS request to MS web service was successful.")
+        dict_o365_all = json.loads(res.read())
+
+    # Process for each record(id) of the endpoint JSON data
+    for dict_o365_record in dict_o365_all:
+        service_area = str(dict_o365_record['serviceArea'])
+        category = str(dict_o365_record['category'])
+
+        if (o365_categories == 0 and category == "Optimize") \
+            or (o365_categories == 1 and (category == "Optimize" or category == "Allow")) \
+            or (o365_categories == 2):
+    
+            if (only_required == 0) or (only_required and str(dict_o365_record['required']) == "True"):
+
+                if (care_common and service_area == "Common") \
+                    or (care_exchange and service_area == "Exchange") \
+                    or (care_sharepoint and service_area == "SharePoint") \
+                    or (care_skype and service_area == "Skype"):
+
+                    if use_url:
+                        # Append "urls" if existent in each record
+                        if dict_o365_record.has_key('urls'):
+                            list_urls = list(dict_o365_record['urls'])
+                            for url in list_urls:
+                                list_urls_to_exclude.append(url)
+
+                        # Append "allowUrls" if existent in each record
+                        if dict_o365_record.has_key('allowUrls'):
+                            list_allow_urls = list(dict_o365_record['allowUrls'])
+                            for url in list_allow_urls:
+                                list_urls_to_exclude.append(url)
+
+                        # Append "defaultUrls" if existent in each record
+                        if dict_o365_record.has_key('defaultUrls'):
+                            list_default_urls = dict_o365_record['defaultUrls']
+                            for url in list_default_urls:
+                                list_urls_to_exclude.append(url)
+
+                    if use_ipv4 or use_ipv6:
+                        # Append "ips" if existent in each record
+                        if dict_o365_record.has_key('ips'):
+                            list_ips = list(dict_o365_record['ips'])
+                            for ip in list_ips:
+                                if re.match('^.+:', ip):
+                                    list_ipv6_to_exclude.append(ip)
+                                else:
+                                    list_ipv4_to_exclude.append(ip)
+
+    log(1, "Number of unique ENDPOINTS to import...")
+
+    # Add administratively defined URLs/IPs and (Re)process to remove duplicates and excluded values
+    if use_url:
+        # Combine lists and remove duplicate URLs
+        urls_undup = list(set(list_urls_to_exclude + additional_urls))
+
+        ## Remove set of excluded URLs from the list of collected URLs
+        for x_url in noimport_urls:
+            urls_undup = [x for x in urls_undup if not x.endswith(x_url)]
+        
+        log(1, "URL: " + str(len(urls_undup)))
+            
+    if use_ipv4:
+        # Combine lists and remove duplicate IPv4 addresses
+        ipv4_undup = list(set(list_ipv4_to_exclude + additional_ipv4))
+
+        ## Remove set of excluded IPv4 addresses from the list of collected IPv4 addresses
+        for x_ip in noimport_ips:
+            ipv4_undup = [x for x in ipv4_undup if not x.endswith(x_ip)]
+
+        log(1, "IPv4 host/net: " + str(len(ipv4_undup)))
+
+    if use_ipv6:
+        # Combine lists and duplicate IPv6 addresses
+        ipv6_undup = list(set(list_ipv6_to_exclude + additional_ipv6))
+
+        ## Remove set of excluded IPv6 addresses from the list of collected IPv6 addresses
+        for x_ip in noimport_ips:
+            ipv6_undup = [x for x in ipv6_undup if not x.endswith(x_ip)]
+
+        log(1, "IPv6 host/net: " + str(len(ipv6_undup)))
+
+
+    # -----------------------------------------------------------------------
+    # URLs, IPv4 & IPv6 addresses formatted for TMSH
+    # -----------------------------------------------------------------------
+    if use_url:
+        # Initialize the URL string
+        url_exclude_list = ""
+
+        # Write URLs to string    
+        for url in urls_undup:
+            url_exclude_list = url_exclude_list + " " + url.lower()
+
+    if use_ipv4:
+        # Initialize the IPv4 string
+        ipv4_exclude_list = ""
+
+        # Write IPv4 addresses to string
+        for ip4 in (list(sorted(ipv4_undup))):
+            ipv4_exclude_list = ipv4_exclude_list + "{subnet " + ip4 + " } "
+
+
+    if use_ipv6:
+        # Initialize the IPv6 string
+        ipv6_exclude_list = ""
+
+        # Write IPv6 addresses to string
+        for ip6 in (list(sorted(ipv6_undup))):
+            ipv6_exclude_list = ipv6_exclude_list + "{subnet " + ip6 + " } "
+
+    # -----------------------------------------------------------------------
+    # Load URL and/or IPv4 and/or IPv6 lists into Network Access resource
+    # -----------------------------------------------------------------------
+    if use_url:
+        for na in na_lists:
+            result = commands.getoutput("tmsh modify /apm resource network-access " + na + " address-space-exclude-dns-name replace-all-with { " + url_exclude_list + " }") 
+            log(2, "Updated " + na + " with latest O365 URL list.")
+
+    if use_ipv4:
+        for na in na_lists:
+            result = commands.getoutput("tmsh modify /apm resource network-access " + na + " address-space-exclude-subnet { " + ipv4_exclude_list + " }") 
+            log(2, "Updated " + na + " with latest IPv4 O365 address list.")
+ 
+    if use_ipv6:
+        for na in na_lists:
+            result = commands.getoutput("tmsh modify /apm resource network-access " + na + " ipv6-address-space-exclude-subnet { " + ipv6_exclude_list + " }")
+            log(2, "Updated " + na + " with latest IPv6 O365 address list.")
+
+    #-----------------------------------------------------------------------
+    # Apply Access Policy and Initiate Config Sync: Device to Group
+    #-----------------------------------------------------------------------
+
+    for ap in access_profiles:
+        result = commands.getoutput("tmsh modify /apm profile access " + ap + " generation-action increment")
+
+    if ha_config == 1:
+        log(1, "Initiating Config-Sync.")
+        result = commands.getoutput("tmsh run cm config-sync to-group " + device_group_name)
+        log(2, result + "\n")
+
+    log(1, "Completed O365 URL/IP address update process.")
+
+if __name__=='__main__':
+    main()
+
+}
+
+                # Create directory
+                catch { 
+                    exec /bin/mkdir -p /shared/o365
+                    # Create the script
+                    set scriptname "/shared/o365/apm_o365_update_${app_name}.py"
+                    set fh [ open $scriptname w+ ]
+                    puts $fh $script
+                    close $fh
+                    # Make the script executable
+                    exec /bin/chmod +x $scriptname
+                }
+                set scriptText "script_${app_name} definition \{ catch \{ exec python $scriptname \} \}"
+                tmsh::create sys icall script $scriptText
+                tmsh::create sys icall handler periodic handler_${app_name} script script_${app_name} interval 86400 first-occurrence [ clock format [clock seconds] -format %Y-%m-%d:23:59:59 ]
+            }
+            
+            presentation {
+			
+				section main {
+					# The entry below creates a large text box that must be filled out with a valid IP Address
+					# For details of APL, look at the iApps developers guide:
+					# https://support.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-iapps-developer-11-4-0.html
+					
+					choice debug display "medium" default "Off" {"Off" => "0", "Low" => "1","High" => "2"}
+                   optional (debug != "0") {
+                        message message1 "Note: logging output goes to /var/log/o365_update"
+                   }
+                    table access_profile {
+                        choice profile display "large" tcl {
+                            package require iapp 1.1.0
+                            return "[iapp::get_items apm profile access]"
+                        }
+                        choice nalist display "large" tcl {
+                            package require iapp 1.1.0
+                            return "[iapp::get_items apm resource network-access]"
+                        }
+                    }
+                    choice endpoint display "medium" default "Worldwide" {"Worldwide" => "Worldwide", "USGovDoD" => "USGovDoD","USGovGCCHigh" => "USGovGCCHigh","China" => "China","Germany" => "Germany"}
+                }
+                section config {    
+                    choice include_exchange display "medium" default "1" {"No" => "0", "Yes" => "1"}
+                    choice include_sharepoint display "medium" default "0" {"No" => "0", "Yes" => "1"}
+                    choice include_skype display "medium" default "0" {"No" => "0", "Yes" => "1"}
+                    choice include_common display "medium" default "0" {"No" => "0", "Yes" => "1"}
+                    choice use_url display "medium" default "1" {"No" => "0", "Yes" => "1"}
+                    choice use_ipv4 display "medium" default "1" {"No" => "0", "Yes" => "1"}
+                    choice use_ipv6 display "medium" default "0" {"No" => "0", "Yes" => "1"}
+                    choice o365_categories display "medium" default "0" {"Optimize Only" => "0", "Optimize and Allow" => "1", "Optimize, Allow and Default" => "2"}
+                    choice only_required display "medium" default "1" {"No" => "0", "Yes" => "1"}
+                    table additional_urls {
+                        string url required display "medium" validator "IpOrFqdn"
+                    }
+                    table additional_ips {
+                        string ip required display "medium" validator "IpAddress"
+                    }
+                    choice dg display "large" tcl {
+                        package require iapp 1.1.0
+                        return "[iapp::get_items cm device-group]"
+                    }
+				}
+
+				text {
+					# Entities below set the text for the questions and section names, etc. Make them simple and relevant.
+					main "Main"
+                    main.debug "Logging Level"
+                    main.message1 ""
+					main.access_profile "Access Profiles / NA List"
+                    main.access_profile.profile "Access Profile"
+                    main.access_profile.nalist "NA List"
+                    main.endpoint "Endpoint"
+                    config "Configuration"
+                    config.include_exchange "Exchange"
+                    config.include_sharepoint "Sharepoint"
+                    config.include_skype "Skype"
+                    config.include_common "Common"
+                    config.use_url "Use URLs"
+                    config.use_ipv4 "Use IPv4 subnets"
+                    config.use_ipv6 "Use IPv6 subnets"
+                    config.o365_categories "O365 Categories"
+                    config.only_required "Required Endpoints Only"
+                    config.additional_urls "Additional URLs"
+                    config.additional_urls.url "FQDN"
+                    config.additional_ips "Additional IPs"
+                    config.additional_ips.ip "IP/Mask"
+                    config.dg "High Availability Device Group"
+
+				}
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description "o365 split tunnel update iCall v1"
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min none
+    requires-modules { apm }
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}
