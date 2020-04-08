@@ -7,6 +7,7 @@
 # v2 - small typo fix line 119 create changed to modify
 # v3 - updated classifier to only include https as it was causing an error
 # v4 - loops through admin partitions and prints out for each
+# v5 - added DTLS check and suggestion
 
 
 suggestions="--- Optimisation Suggestions ---\n"
@@ -73,7 +74,7 @@ echo "--------------------------------"
 
 # loop through adminstrative partitions
 for partition in `tmsh -q list auth partition one-line|awk '{print $3}'`;do
-    suggestions+="------- Partition /$partition -------"
+    suggestions+="\n------- Partition /$partition -------\n"
 
     echo " --- Partition /$partition ---"
     echo
@@ -96,9 +97,9 @@ for partition in `tmsh -q list auth partition one-line|awk '{print $3}'`;do
 
     echo
     echo "Network Access Profile Compression"
-    echo "------------------------------------------------------------------------------------"
-    echo -e " Name\t\t| Compression\t| Split-Tunneling\t| Client Traffic Classifier"
-    echo "------------------------------------------------------------------------------------"
+    echo "-----------------------------------------------------------------------------------------------------------"
+    echo -e " Name\t\t\t| Compression\t| Split-Tunneling\t| Client Traffic Classifier\t| DTLS"
+    echo "-----------------------------------------------------------------------------------------------------------"
     for profile in `tmsh -q -c "cd /$partition;list apm resource network-access one-line"|awk '{print $4}'`;do
             # Compression
             if [ `tmsh -q -c "cd /$partition;list apm resource network-access $profile one-line"|grep "compression gzip"|wc -l` -gt 0 ];then
@@ -127,6 +128,12 @@ for partition in `tmsh -q list auth partition one-line|awk '{print $3}'`;do
                     suggestions+="tmsh create apm resource client-traffic-classifier /$partition/client-traffic-classifier-1 { entries add { entry { client-rate-class rate_class_1M dst-ip any dst-mask any dst-port https src-ip any src-mask any } } }\n"
                     suggestions+="tmsh modify apm resource network-access /$partition/$profile client-traffic-classifier client-traffic-classifier-1\n"
             fi
+            if [ `tmsh -q -c "cd /$partition;list apm resource network-access $profile one-line"|grep "dtls true"|wc -l` -gt 0 ];then
+                    echo -en "\t\t\t| Enabled"
+            else
+                echo -en "\t\t\t| Disabled"
+                suggestions+=" - To turn on DTLS, create a duplicate virtual server listening on UDP and enabled DTLS in the Network Access List Network Settings ( see https://devcentral.f5.com/s/articles/APM-DTLS-Virtual-Server-iApp )\n"
+            fi
             # Check for SNAT automap
             if [ `tmsh -q -c "cd /$partition;list apm resource network-access $profile one-line all-properties"|grep "snat automap"|wc -l` -gt 0 ];then
                     suggestions+=" - Network Access profile /$partition/$profile is using SNAT automap. Consider using a SNAT pool\n"
@@ -135,7 +142,7 @@ for partition in `tmsh -q list auth partition one-line|awk '{print $3}'`;do
             echo ""
 
     done
-    echo "------------------------------------------------------------------------------------"
+    echo "-----------------------------------------------------------------------------------------------------------"
 
     # Check VSs for mirroring
 
@@ -151,4 +158,5 @@ done
 
 
 echo
-echo -en "$suggestions"
+echo -e "$suggestions"
+echo "-----------------------------------------------------------------------------------------------------------"
