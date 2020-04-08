@@ -1,0 +1,113 @@
+cli admin-partitions {
+    update-partition Common
+}
+sys application template /Common/apm_dtls_iapp {
+    actions {
+        definition {
+            html-help {
+            }
+            implementation {
+                set app_dir [tmsh::pwd]
+				set app_name $tmsh::app_name
+
+                # https://support.f5.com/csp/article/K54955814
+                set vs [lindex [ tmsh::get_config ltm virtual $::main__vsname ] 0]
+                set profiles [ tmsh::get_field_value $vs profiles ]
+                set connectivityProfile ""
+                set clientsslProfile ""
+                foreach profile $profiles {
+                    set name [ lindex [ split $profile ] 1 ]
+                    set newname "${name}-dtls"
+                    # Retrieve the connectivity profile
+                    if { ! [ catch { tmsh::get_config apm profile connectivity $name } ] } {
+                        set connectivityProfile $name
+                    }
+
+                    # Retrieve the client-ssl profile
+                    if { ! [ catch { tmsh::get_config ltm profile client-ssl $name } ] } {
+                        set clientsslProfile $name
+                    }
+                }
+                if { $connectivityProfile == "" } {
+                    error "Error! Virtual server $::main__vsname does not have a connectivity profile assigned"
+                }
+                if { $clientsslProfile == "" } {
+                    error "Error! Virtual server $::main__vsname does not have a client SSL profile assigned"
+                }
+                set vip "[lindex [split [ tmsh::get_field_value $vs destination ] : ] 0 ]:4433"
+                # Check if VLANs are set 
+                if { [catch {set vlans [ tmsh::get_field_value $vs vlans]} err ] } {
+                    # VLANS are not configured
+                    set vlans ""
+                } else {
+                    # VLANS are configured
+                    if { $vlans != "" } {
+                        set vlans " vlans-enabled vlans replace-all-with \{ $vlans \}"
+                    } else {
+                        set vlans ""
+                    }
+                }
+                # Check if SNAT is set
+                if { [ catch {set snatType [ tmsh::get_field_value $vs source-address-translation.type ] } err ]} {
+                    # No SNAT pool
+                    set snat ""
+                } elseif { $snatType == "automap" } {
+                    # Automap
+                    set snat " source-address-translation \{ type automap \}"
+                } elseif { $snatType == "snat" } {
+                    # SNAT pool is set
+                    set snatpool [ tmsh::get_field_value $vs source-address-translation.pool ]
+                    set snat " source-address-translation \{ type snat pool $snatpool \}"
+                } else {
+                    # Should never hit this
+                    set snat ""
+                }
+                
+                # Create VS
+                tmsh::create ltm virtual $newname $vlans $snat ip-protocol udp destination $vip profiles replace-all-with \{ $connectivityProfile \{ context clientside \} $clientsslProfile \{ context clientside \} \}
+                # Change network access profile
+                tmsh::stateless enabled
+                tmsh::modify apm resource network-access $::main__networkAccessProfile dtls true
+                tmsh::stateless disabled
+
+            }
+            
+            presentation {
+			
+				section main {
+					# The entry below creates a large text box that must be filled out with a valid IP Address
+					# For details of APL, look at the iApps developers guide:
+					# https://support.f5.com/kb/en-us/products/big-ip_ltm/manuals/product/bigip-iapps-developer-11-4-0.html
+					message intro "This iApp will create a DTLS virtual server based on your existing VPN virtual server, and add DTLS support to the network access profile"
+
+                    choice vsname display "large" tcl {
+							package require iapp 1.1.0
+							return "[iapp::get_items ltm virtual]"
+					}
+                    choice networkAccessProfile display "large" tcl {
+							package require iapp 1.1.0
+							return "[iapp::get_items apm resource network-access]"
+					}
+				}
+
+				text {
+					# Entities below set the text for the questions and section names, etc. Make them simple and relevant.
+					main "Main"
+                    main.intro "Usage"
+					main.vsname "VPN Virtual Server"
+					main.networkAccessProfile "Network Access Profile"
+				}
+            }
+            role-acl none
+            run-as none
+        }
+    }
+    description "iApp to create a DTLS virtual server based on your existing TCP VPN virtual server"
+    ignore-verification false
+    requires-bigip-version-max none
+    requires-bigip-version-min none
+    requires-modules { apm }
+    signing-key none
+    tmpl-checksum none
+    tmpl-signature none
+}
