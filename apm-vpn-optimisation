@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Version 4 1/4/2020 P.White
+# Version 6 9/4/2020 P.White
 # This is a script to check your APM system and give suggestions to reduce CPU usage
 # Taken from suggestions at https://support.f5.com/csp/article/K46161759
 
@@ -8,6 +8,7 @@
 # v3 - updated classifier to only include https as it was causing an error
 # v4 - loops through admin partitions and prints out for each
 # v5 - added DTLS check and suggestion
+# v6 - fixed bugs with connectivity reporting and commands
 
 
 suggestions="--- Optimisation Suggestions ---\n"
@@ -89,8 +90,8 @@ for partition in `tmsh -q list auth partition one-line|awk '{print $3}'`;do
             if [ `tmsh -q -c "cd /$partition;list apm profile connectivity $profile one-line"|grep "compress-gzip-level 0"|wc -l` -gt 0 ];then
                     echo -e "$profile\t\tDisabled"
             else
-                    suggestions+=" - To turn off compression in the connectivity profile, run the command 'tmsh modify apm profile connectivity /$partition/$profile compression disabled'\n"
-                    echo -e "$profile\t\tDisabled"
+                    suggestions+=" - To turn off compression in the connectivity profile, run the command 'tmsh modify apm profile connectivity /$partition/$profile compress-gzip-level 0'\n"
+                    echo -e "$profile\t\tEnabled"
             fi
     done
     echo "--------------------------------"
