@@ -1,4 +1,3 @@
-
 cli admin-partitions {
     update-partition Common
 }
@@ -96,7 +95,7 @@ foreach {profile} $networkAccessProfiles {
     tmsh::begin_transaction
     if { $currentStatus != "true" && ${split-tunneling} > 0 } {
         tmsh::log "apm-vpn-optimisation:Turning on split-tunneling for profile $name: split-tunneling true"
-        tmsh::modify apm resource network-access $name address-space-exclude-dns-name add \{ office.com office365.com sharepoint.com sharepointonline.com microsoftonline.com google.com gmail.com facebook.com \}
+        tmsh::modify apm resource network-access $name address-space-exclude-dns-name add \{ office.com microsoftonline.com google.com gmail.com facebook.com \}
         tmsh::modify apm resource network-access $name address-space-include-subnet \{\{ subnet 10.0.0.0/8 \} \{ subnet 172.16.0.0/16 \} \{ subnet 192.168.0.0/16 \}\}
         tmsh::modify apm resource network-access $name split-tunneling true
         set changed 1
@@ -145,7 +144,6 @@ foreach {profile} $networkAccessProfiles {
     }
     tmsh::commit_transaction
 }
-}
 # Apply profiles
 if { $changed > 0 } {
     set accessProfiles [tmsh::get_config apm profile type]
@@ -158,6 +156,7 @@ if { $changed > 0 } {
         }
     }
 }
+
 # Left blank
 }
 				tmsh::create sys icall script "${app_name}_avo_script definition { [tmsh::expand_macro $icallTemplate ] }"
@@ -185,7 +184,7 @@ if { $changed > 0 } {
             run-as none
         }
     }
-    description "APM VPN Optimisation iApp v3"
+    description "APM VPN Optimisation iApp v2"
     ignore-verification false
     requires-bigip-version-max none
     requires-bigip-version-min none
